@@ -3,14 +3,18 @@ package com.stealthchat.backend.controller;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.context.event.EventListener;
 import org.springframework.messaging.handler.annotation.MessageMapping;
 import org.springframework.messaging.handler.annotation.Payload;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.messaging.simp.stomp.StompHeaderAccessor;
 import org.springframework.stereotype.Controller;
+import org.springframework.web.socket.messaging.SessionSubscribeEvent;
 
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 @Controller
 public class RelayController {
@@ -18,17 +22,20 @@ public class RelayController {
     private static final Logger logger = LoggerFactory.getLogger(RelayController.class);
 
     private final SimpMessagingTemplate messagingTemplate;
-    private final StringRedisTemplate redisTemplate;
+
+    // In-memory queues for offline messages and keys
+    private final ConcurrentHashMap<String, Queue<Map<String, Object>>> messageQueue = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Queue<Map<String, Object>>> keysQueue = new ConcurrentHashMap<>();
+
+    private static final int MAX_QUEUE_SIZE = 100;
 
     @Autowired
-    public RelayController(SimpMessagingTemplate messagingTemplate, StringRedisTemplate redisTemplate) {
+    public RelayController(SimpMessagingTemplate messagingTemplate) {
         this.messagingTemplate = messagingTemplate;
-        this.redisTemplate = redisTemplate;
     }
 
     /**
      * Handles incoming chat messages from a client.
-     * Maps to STOMP destination: /app/chat.send
      */
     @MessageMapping("/chat.send")
     public void relayMessage(@Payload Map<String, Object> payload) {
@@ -37,50 +44,19 @@ public class RelayController {
         
         logger.info("Received message to relay. ID: {}, Target: {}", messageId, recipientId);
 
-        // Optional: Cache the message in Redis with a 24-hour TTL in case the recipient is offline
-        // The key would be a queue list per recipient.
-        /* 
-        String redisKey = "stealth:offline:" + recipientId;
-        try {
-            // Serialize and push to list
-            String jsonPayload = convertToJson(payload);
-            redisTemplate.opsForList().rightPush(redisKey, jsonPayload);
-            // Ensure TTL is 24 hours
-            redisTemplate.expire(redisKey, 24, TimeUnit.HOURS);
-        } catch (Exception e) {
-            logger.error("Failed to cache message in Redis", e);
+        // Buffer the message in case the recipient is offline
+        Queue<Map<String, Object>> queue = messageQueue.computeIfAbsent(recipientId, k -> new ConcurrentLinkedQueue<>());
+        if (queue.size() >= MAX_QUEUE_SIZE) {
+            queue.poll(); // Evict oldest
         }
-        */
+        queue.add(payload);
 
-        // Immediately relay to the connected recipient if they are online
-        // Destination: /topic/messages/{recipientId}
-        messagingTemplate.convertAndSend(
-                "/topic/messages/" + recipientId,
-                payload
-        );
-    }
-
-    /**
-     * Handles incoming read/delivery receipts.
-     * Maps to STOMP destination: /app/chat.receipt
-     */
-    @MessageMapping("/chat.receipt")
-    public void relayReceipt(@Payload Map<String, Object> payload) {
-        // We assume the Android client sends recipientId for the receipt target
-        String recipientId = (String) payload.getOrDefault("recipientId", "THE_OTHER_USER");
-        String messageId = (String) payload.get("messageId");
-        
-        logger.info("Relaying receipt for message ID: {} to Target: {}", messageId, recipientId);
-        
-        messagingTemplate.convertAndSend(
-                "/topic/receipts/" + recipientId,
-                payload
-        );
+        // Try to relay immediately in case they are online
+        messagingTemplate.convertAndSend("/topic/messages/" + recipientId, payload);
     }
 
     /**
      * Handles incoming public key exchange broadcasts.
-     * Maps to STOMP destination: /app/chat.keys
      */
     @MessageMapping("/chat.keys")
     public void relayKeys(@Payload Map<String, Object> payload) {
@@ -89,42 +65,64 @@ public class RelayController {
         
         logger.info("Relaying public key from {} to {}", senderId, recipientId);
         
-        messagingTemplate.convertAndSend(
-                "/topic/keys/" + recipientId,
-                payload
-        );
+        // Buffer the key in case the recipient is offline
+        Queue<Map<String, Object>> queue = keysQueue.computeIfAbsent(recipientId, k -> new ConcurrentLinkedQueue<>());
+        if (queue.size() >= MAX_QUEUE_SIZE) {
+            queue.poll(); // Evict oldest
+        }
+        queue.add(payload);
+
+        messagingTemplate.convertAndSend("/topic/keys/" + recipientId, payload);
+    }
+
+    /**
+     * Handles incoming read/delivery receipts.
+     * We don't buffer these to save memory, they are opportunistic.
+     */
+    @MessageMapping("/chat.receipt")
+    public void relayReceipt(@Payload Map<String, Object> payload) {
+        String recipientId = (String) payload.getOrDefault("recipientId", "THE_OTHER_USER");
+        messagingTemplate.convertAndSend("/topic/receipts/" + recipientId, payload);
     }
 
     /**
      * Handles typing indicators.
-     * Maps to STOMP destination: /app/chat.typing
+     * We don't buffer typing indicators.
      */
     @MessageMapping("/chat.typing")
     public void relayTyping(@Payload Map<String, Object> payload) {
         String recipientId = (String) payload.getOrDefault("recipientId", "THE_OTHER_USER");
-        
-        messagingTemplate.convertAndSend(
-                "/topic/typing/" + recipientId,
-                payload
-        );
+        messagingTemplate.convertAndSend("/topic/typing/" + recipientId, payload);
     }
-    
-    // Quick and dirty manual serialization to avoid defining a bean or adding Jackson overhead here
-    // In production, we'd use Jackson ObjectMapper.
-    private String convertToJson(Map<String, Object> map) {
-        StringBuilder sb = new StringBuilder("{");
-        boolean first = true;
-        for (Map.Entry<String, Object> entry : map.entrySet()) {
-            if (!first) sb.append(",");
-            sb.append("\"").append(entry.getKey()).append("\":");
-            if (entry.getValue() instanceof String) {
-                sb.append("\"").append(entry.getValue()).append("\"");
-            } else {
-                sb.append(entry.getValue());
-            }
-            first = false;
+
+    /**
+     * Listens for clients subscribing to topics.
+     * If they subscribe to their message or key topics, we flush any buffered payloads to them.
+     */
+    @EventListener
+    public void handleSubscribeEvent(SessionSubscribeEvent event) {
+        StompHeaderAccessor accessor = StompHeaderAccessor.wrap(event.getMessage());
+        String destination = accessor.getDestination();
+
+        if (destination == null) return;
+
+        if (destination.startsWith("/topic/messages/")) {
+            String userId = destination.substring("/topic/messages/".length());
+            flushQueue(userId, messageQueue, destination);
+        } else if (destination.startsWith("/topic/keys/")) {
+            String userId = destination.substring("/topic/keys/".length());
+            flushQueue(userId, keysQueue, destination);
         }
-        sb.append("}");
-        return sb.toString();
+    }
+
+    private void flushQueue(String userId, ConcurrentHashMap<String, Queue<Map<String, Object>>> queueMap, String destination) {
+        Queue<Map<String, Object>> queue = queueMap.get(userId);
+        if (queue != null && !queue.isEmpty()) {
+            logger.info("Flushing {} buffered payloads to {}", queue.size(), destination);
+            Map<String, Object> payload;
+            while ((payload = queue.poll()) != null) {
+                messagingTemplate.convertAndSend(destination, payload);
+            }
+        }
     }
 }

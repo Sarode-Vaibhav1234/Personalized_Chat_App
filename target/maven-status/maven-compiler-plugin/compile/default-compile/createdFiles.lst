@@ -1,0 +1,5 @@
+com\stealthchat\backend\StealthBackendApplication.class
+com\stealthchat\backend\service\BlobStorageService.class
+com\stealthchat\backend\config\WebSocketConfig.class
+com\stealthchat\backend\controller\BlobController.class
+com\stealthchat\backend\controller\RelayController.class
